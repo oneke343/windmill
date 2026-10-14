@@ -19,6 +19,7 @@
 	import { resource } from 'runed'
 	import { getDraftItems } from '$lib/workspaceDrafts.svelte'
 	import { disableHubStore, userStore, workspaceStore } from '$lib/stores'
+	import { useOperatorBuilderFlows } from '$lib/operatorWriteRights'
 	import type uFuzzy from '@leeoniya/ufuzzy'
 	import {
 		ArrowDownUp,
@@ -63,6 +64,9 @@
 	import { base } from '$lib/base'
 	import BulkActionsBar from './BulkActionsBar.svelte'
 	import { HomeSelection, setHomeSelection, toBulkItem } from './homeSelection.svelte'
+
+	const operatorBuilderFlows = useOperatorBuilderFlows()
+
 	interface Props {
 		subtab?: 'flow' | 'script' | 'app' | 'agent'
 		showEditButtons?: boolean
@@ -356,7 +360,9 @@
 			canWrite:
 				canWrite(it.path, (it.extra_perms ?? {}) as any, $userStore) &&
 				(it.type === 'script' || it.workspace_id == $workspaceStore) &&
-				!$userStore?.operator
+				// The builder right covers flows only; a script or an app is still off limits, so
+				// the row must not offer edit or delete for those.
+				(!$userStore?.operator || (it.type === 'flow' && $operatorBuilderFlows))
 		}
 		// combinedItems reads a script's time from `created_at`; the endpoint's
 		// unified `edited_at` holds exactly that for scripts.
@@ -1204,7 +1210,7 @@
 	 * whose direct-deploy protection cleared `showEditButtons` — must not be shown them.
 	 * Reading archived items is not a write, so it is not gated on this.
 	 */
-	let canCreateHere = $derived(!$userStore?.operator && showEditButtons)
+	let canCreateHere = $derived((!$userStore?.operator || $operatorBuilderFlows) && showEditButtons)
 
 	// The workspace itself holds nothing — no filter is narrowing the list away. It stays
 	// false until the first load resolves: a skeleton already means "loading", and the
@@ -2033,9 +2039,12 @@
 			     the menu itself does no permission check. -->
 			{#if canCreateHere}
 				<!-- No hub entry where the instance has the hub turned off: the same setting the
-				     script and flow hub pickers observe. -->
+				     script and flow hub pickers observe. Nor for a builder: a hub project brings
+				     scripts and apps along. -->
 				<CreateActionsMenu
-					onImportHubProject={$disableHubStore ? undefined : () => (hubPickerOpen = true)}
+					onImportHubProject={$disableHubStore || $operatorBuilderFlows
+						? undefined
+						: () => (hubPickerOpen = true)}
 				/>
 			{/if}
 		</div>
