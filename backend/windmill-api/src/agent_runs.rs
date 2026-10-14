@@ -26,7 +26,9 @@ use windmill_queue::{push, PushArgs, PushIsolationLevel};
 use crate::ai_evals::run::config_to_draft;
 use crate::ai_evals::subject::AgentDraft;
 use crate::db::{ApiAuthed, DB};
-use crate::jobs::{handle_chat_conversation_messages, set_flow_memory_id, RunJobQuery};
+use crate::jobs::{
+    handle_chat_conversation_messages, run_end_user_email, set_flow_memory_id, RunJobQuery,
+};
 
 /// The id the agent's step carries in the run, as the editor's chat names it. A token scoped to
 /// `jobs:run:agents:<path>` reads its runs back by it (`require_job_within_read_scope`).
@@ -109,7 +111,12 @@ pub(crate) async fn run_agent(
             PushIsolationLevel::Isolated(user_db.clone(), authed.clone().into()),
         )
     };
+    if on_behalf_of.is_some() {
+        #[cfg(all(feature = "parquet", feature = "private"))]
+        check_attachments_readable(&db, &authed, &w_id, &args).await?;
+    }
     let scope_ceiling = windmill_api_auth::caller_scope_ceiling(&db, &authed).await?;
+    let end_user_email = run_end_user_email(&db, &w_id, &authed, None).await?;
     let (uuid, mut tx) = push(
         &db,
         isolation,
@@ -141,7 +148,7 @@ pub(crate) async fn run_agent(
         None,
         push_authed.as_ref(),
         false,
-        None,
+        end_user_email,
         authed.trigger_or_fallback(None),
         None,
         scope_ceiling.as_deref(),
@@ -170,6 +177,50 @@ pub(crate) async fn run_agent(
     tx.commit().await?;
 
     Ok((StatusCode::CREATED, uuid.to_string()))
+}
+
+/// The step fetches the message's files with its job's token, so a run as the agent's identity
+/// would read any file that identity can: a caller attaches only what they could download
+/// themselves, checked as `sign_s3_objects` checks a key before signing it.
+#[cfg(all(feature = "parquet", feature = "private"))]
+async fn check_attachments_readable(
+    db: &DB,
+    authed: &ApiAuthed,
+    w_id: &str,
+    args: &HashMap<String, Box<RawValue>>,
+) -> Result<()> {
+    use crate::job_helpers_oss::{
+        get_large_file_storage, get_workspace_s3_resource_and_check_paths,
+    };
+    use windmill_common::db::DbWithOptAuthed;
+    use windmill_types::s3::{S3Object, S3Permission};
+
+    let Some(raw) = args.get("user_attachments") else {
+        return Ok(());
+    };
+    let attachments: Option<Vec<S3Object>> = serde_json::from_str(raw.get())
+        .map_err(|e| Error::BadRequest(format!("invalid user_attachments: {e}")))?;
+    for attachment in attachments.iter().flatten().filter(|a| !a.s3.is_empty()) {
+        // The path check is skipped, not failed, when the storage does not resolve.
+        if get_large_file_storage(db, w_id, attachment.storage.clone())
+            .await?
+            .is_none()
+        {
+            return Err(windmill_object_store::workspace_storage_not_found(
+                attachment.storage.as_deref(),
+            ));
+        }
+        get_workspace_s3_resource_and_check_paths(
+            &DbWithOptAuthed::from_authed(authed, db.clone(), None),
+            Some(authed),
+            w_id,
+            attachment.storage.clone(),
+            &[(&attachment.s3, S3Permission::READ)],
+            None,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// The agent as a one-step flow, validated by deserializing through `FlowValue` rather than
