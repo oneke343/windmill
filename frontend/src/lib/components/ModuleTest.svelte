@@ -2,6 +2,7 @@
 	import {
 		ScriptService,
 		type AiAgent,
+		type AiDecision,
 		type FlowModule,
 		type InputTransform,
 		type Job
@@ -18,9 +19,10 @@
 		normalizeAgentRef,
 		type LinkedAgentDraft
 	} from './flows/linkedAgentDrafts'
-	import { AGENT_FLOW_LOCAL_KEYS } from './flows/agentResourceUtils'
-	import { agentTestInputTransforms } from './flows/agentFormFields'
+	import { AGENT_LINKED_STEP_KEYS } from './flows/agentResourceUtils'
+	import { AGENT_OVERRIDE_KEYS, agentTestInputTransforms } from './flows/agentFormFields'
 	import { sendUserToast } from '$lib/toast'
+	import { quickjsReady } from '$lib/utils/quickjsEval.svelte'
 	import { useOperatingWorkspace } from '$lib/components/operatingWorkspace.svelte'
 
 	const operatingWorkspace = useOperatingWorkspace()
@@ -67,7 +69,8 @@
 	// that follow each flow edit stay quiet, so without this a failing expression is silently
 	// `undefined` in what the run is built from. Manually edited args are preserved across the
 	// refresh by `initializeFromSchema`.
-	export function runTestWithStepArgs() {
+	export async function runTestWithStepArgs() {
+		await quickjsReady()
 		stepsInputArgs?.updateStepArgs(
 			mod.id,
 			flowStateStore.val,
@@ -183,7 +186,13 @@
 			const inputTransforms = agentTestInputTransforms(
 				agentVal.agent ? {} : ((agentVal.input_transforms ?? {}) as Record<string, InputTransform>),
 				args,
-				draft ? AGENT_FLOW_LOCAL_KEYS : Object.keys(args)
+				// An override the step does not hold is left out: fed from the form it would arrive as an
+				// authored empty value, which clears the agent's saved effort.
+				(draft ? AGENT_LINKED_STEP_KEYS : Object.keys(args)).filter(
+					(key) =>
+						!(AGENT_OVERRIDE_KEYS as readonly string[]).includes(key) ||
+						val.input_transforms?.[key] != undefined
+				)
 			)
 
 			await jobLoader?.runFlowPreview(
@@ -203,6 +212,28 @@
 									tool_inputs: agentVal.tool_inputs,
 									input_transforms: inputTransforms as AiAgent['input_transforms']
 								} as Extract<FlowModule['value'], { type: 'aiagent' }>
+							}
+						]
+					},
+					summary: '',
+					schema
+				},
+				callbacks,
+				previewBase
+			)
+		} else if (val.type == 'aidecision') {
+			const { schema } = await loadSchemaFromModule(mod, opWs)
+			const inputTransforms = Object.fromEntries(
+				Object.keys(args).map((key) => [key, { expr: `flow_input.${key}`, type: 'javascript' }])
+			) as AiDecision['input_transforms']
+			await jobLoader?.runFlowPreview(
+				args,
+				{
+					value: {
+						modules: [
+							{
+								id: mod.id,
+								value: { type: 'aidecision', input_transforms: inputTransforms, tag: val.tag }
 							}
 						]
 					},

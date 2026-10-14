@@ -744,13 +744,15 @@ async fn is_premium(
 
 #[derive(Serialize)]
 struct BillableSeatsResponse {
-    /// Both omitted when the seats counted are another workspace's: a fork member need not be a
+    /// All three omitted when the seats counted are another workspace's: a fork member need not be a
     /// member of the billing root, so the root's headcount is not theirs to read. The total is,
     /// since it is the divisor of the quota their own executions draw on.
     #[serde(skip_serializing_if = "Option::is_none")]
     developers: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     operators: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_accounts: Option<i64>,
     seats: i64,
 }
 
@@ -780,6 +782,7 @@ async fn get_billable_seats(
     Ok(Json(BillableSeatsResponse {
         developers: own.then_some(counted.developers),
         operators: own.then_some(counted.operators),
+        service_accounts: own.then_some(counted.service_accounts),
         seats: counted.seats,
     }))
 }
@@ -2322,6 +2325,9 @@ struct DataTableTables {
     /// What the role the listing connected as may create.
     can_create_schema: bool,
     creatable_schemas: Vec<String>,
+    /// Whether its schema is kept as versioned migrations, which a change made with plain SQL
+    /// would bypass.
+    migrations_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -2567,8 +2573,17 @@ async fn list_one_datatable_tables(
         default_role: windmill_common::datatable_roles::ADMIN_DATATABLE_ROLE.to_string(),
         can_create_schema: false,
         creatable_schemas: vec![],
+        migrations_enabled: false,
     };
     let result: Result<()> = async {
+        // Read from the workspace settings alone, so it is known even when the database is not
+        // reachable.
+        entry.migrations_enabled = crate::datatable_migrations::datatable_migrations_enabled(
+            db,
+            w_id,
+            &entry.datatable_name,
+        )
+        .await?;
         let governing = resolve_governing_datatable(db, w_id, &entry.datatable_name).await?;
         entry.instance = governing.role_cluster().is_some();
         let usable =
@@ -3579,6 +3594,97 @@ pub(crate) async fn pg_import_dump(target_db: &PgDatabase, dump_file: &DumpFile)
     Ok(())
 }
 
+/// Carry the source database's own settings (`ALTER DATABASE ... SET`) over to a copy. `pg_dump`
+/// only emits them with `--create`, so a copy otherwise resolves unqualified names, its
+/// `_wm_migrations` included, through the server's default `search_path` rather than the source's.
+/// A setting the copy's connection may not set is skipped with a warning rather than failing it.
+/// Called once nothing else writes to the copy, which a copied read-only default would refuse.
+pub(crate) async fn copy_database_settings(
+    db: &DB,
+    source: &PgDatabase,
+    target: &PgDatabase,
+) -> Result<()> {
+    let (source_client, connection) = source.connect(Some(db)).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::error!("Datatable connection error: {}", e);
+        }
+    });
+    let settings: Vec<String> = source_client
+        .query(
+            "SELECT unnest(setconfig) FROM pg_db_role_setting WHERE setrole = 0 \
+             AND setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            Error::internal_err(format!(
+                "Failed to read the settings of database '{}': {}",
+                source.dbname,
+                pg_error_message(&e)
+            ))
+        })?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    drop(source_client);
+    if settings.is_empty() {
+        return Ok(());
+    }
+
+    let (mut client, connection) = target.connect(Some(db)).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::error!("Datatable connection error: {}", e);
+        }
+    });
+    let quoted_db = render_db_quoted_identifier(&target.dbname, DbType::Postgresql);
+    for setting in settings {
+        let Some((name, value)) = setting.split_once('=') else {
+            continue;
+        };
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        {
+            tracing::warn!(
+                "Not copying database setting '{name}' to '{}'",
+                target.dbname
+            );
+            continue;
+        }
+        let quoted_name = name
+            .split('.')
+            .map(|part| render_db_quoted_identifier(part, DbType::Postgresql))
+            .collect::<Vec<_>>()
+            .join(".");
+        // `FROM CURRENT` takes the value in the stored text form, which `SET name TO value` would
+        // need re-quoted per setting type. Set transaction-locally: a session-wide `role` or
+        // `default_transaction_read_only` would make every later `ALTER DATABASE` fail.
+        let applied = async {
+            let tx = client.transaction().await?;
+            tx.execute("SELECT set_config($1, $2, true)", &[&name, &value])
+                .await?;
+            tx.batch_execute(&format!(
+                "ALTER DATABASE {quoted_db} SET {quoted_name} FROM CURRENT"
+            ))
+            .await?;
+            tx.commit().await
+        }
+        .await;
+        if let Err(e) = applied {
+            tracing::warn!(
+                "Could not copy setting '{name}' of database '{}' to '{}': {}",
+                source.dbname,
+                target.dbname,
+                pg_error_message(&e)
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct CreatePgDatabaseRequest {
     /// The datatable source to determine connection info: 'datatable://name' or '$res:path'
@@ -3842,12 +3948,33 @@ async fn import_pg_database(
     // the ACLs are user intent (`REVOKE ... FROM PUBLIC`) and dropping them widens access.
     let no_acl = target_kind.is_some() || source_kind.is_some();
 
+    // Only a database made to be a copy takes on the source's bookkeeping and settings: without an
+    // override the target is a data table's own live database, whose settings are its owner's.
+    let fresh_copy = req.target_dbname_override.is_some();
+    let migrations_lock = if schema_only && fresh_copy {
+        Some(
+            crate::datatable_migrations::lock_migration_runs_on(&db, &source_pg, &req.source)
+                .await?,
+        )
+    } else {
+        None
+    };
     let dump_file = pg_dump_database(
         &source_pg,
         PgDumpOptions { schema_only, no_owner: true, no_acl, ..Default::default() },
     )
     .await?;
+    let applied = match migrations_lock {
+        Some(client) => Some(crate::datatable_migrations::read_applied_migrations(&client).await?),
+        None => None,
+    };
     pg_import_dump(&target_pg, &dump_file).await?;
+    if let Some(applied) = applied {
+        crate::datatable_migrations::write_applied_migrations(&db, &target_pg, &applied).await?;
+    }
+    if fresh_copy {
+        copy_database_settings(&db, &source_pg, &target_pg).await?;
+    }
     if let Some(tx) = fork_lock {
         tx.commit().await?;
     }
@@ -6314,8 +6441,8 @@ async fn set_encryption_key(
 async fn reencrypt_git_sync_secrets(
     conn: &mut sqlx::PgConnection,
     w_id: &str,
-    old: &magic_crypt::MagicCrypt256,
-    new: &magic_crypt::MagicCrypt256,
+    old: &windmill_common::variables::WorkspaceCrypt,
+    new: &windmill_common::variables::WorkspaceCrypt,
 ) -> Result<()> {
     let Some((mut credentials, mut git_sync)) =
         sqlx::query_as::<_, (serde_json::Value, Option<serde_json::Value>)>(
@@ -7649,7 +7776,7 @@ async fn clone_scripts(
             dedicated_worker, ws_error_handler_muted, priority, timeout,
             delete_after_use, delete_after_secs, restart_unless_cancelled, concurrency_key,
             visible_to_runner_only, auto_kind, codebase, has_preprocessor,
-            on_behalf_of, on_behalf_of_email, assets, modules
+            on_behalf_of, on_behalf_of_email, assets, modules, job_token_scopes
         )
         SELECT
             $1, hash, path, parent_hashes, summary, description, content,
@@ -7681,7 +7808,7 @@ async fn clone_scripts(
                         UNION ALL
                         SELECT 1 FROM password p WHERE p.email = on_behalf_of
                           AND p.super_admin))
-            END, on_behalf_of_email, assets, modules
+            END, on_behalf_of_email, assets, modules, job_token_scopes
         FROM script
         WHERE workspace_id = $2"#,
         target_workspace_id,
@@ -8051,7 +8178,8 @@ async fn clone_flows(
             workspace_id, path, summary, description, value, edited_by, edited_at,
             archived, schema, extra_perms, dependency_job, tag,
             ws_error_handler_muted, dedicated_worker, timeout, visible_to_runner_only,
-            concurrency_key, versions, on_behalf_of, on_behalf_of_email, lock_error_logs
+            concurrency_key, versions, on_behalf_of, on_behalf_of_email, lock_error_logs,
+            job_token_scopes
         )
         SELECT $2, path, summary, description, value, edited_by, edited_at,
                archived, schema, extra_perms, NULL, tag,
@@ -8077,7 +8205,7 @@ async fn clone_flows(
                            UNION ALL
                            SELECT 1 FROM password p WHERE p.email = on_behalf_of
                              AND p.super_admin))
-               END, on_behalf_of_email, lock_error_logs
+               END, on_behalf_of_email, lock_error_logs, job_token_scopes
         FROM flow
         WHERE workspace_id = $1",
         source_workspace_id,
@@ -10533,7 +10661,7 @@ async fn edit_workspace(
 pub(crate) async fn archive_workspace_impl(
     db: &DB,
     w_id: &str,
-    username: &str,
+    authed: &ApiAuthed,
     // When archiving a dev workspace, its parent prod. The pairing teardown (clear is_dev + drop the
     // prod's lock) is folded into the same transaction as `deleted = true` so it's atomic with the
     // archive — a later failure can't strand a half-archived dev that's still flagged/locked.
@@ -10647,7 +10775,7 @@ pub(crate) async fn archive_workspace_impl(
         let axum::Json(canceled_jobs) = windmill_api_jobs::cancel_jobs(
             jobs_to_cancel,
             db,
-            username,
+            authed,
             w_id,
             false, // force_cancel
         )
@@ -10707,7 +10835,7 @@ async fn archive_workspace(
     // dev workspace, which only applies to a workspace that is itself a dev (`dev_lock_parent`): a
     // root archived out from under its dev is the pre-existing shape and not this pairing's to police.
     let (schedules_count, canceled_count, deleted_tokens_count) =
-        archive_workspace_impl(&db, &w_id, &authed.username, dev_lock_parent.as_deref()).await?;
+        archive_workspace_impl(&db, &w_id, &authed, dev_lock_parent.as_deref()).await?;
 
     // Audit log
     let mut tx = db.begin().await?;
@@ -11628,9 +11756,12 @@ struct ChangeOperatorSettings {
     /// withdraw or grant the right on every push.
     ///
     /// `builder_flows` lets every operator of this workspace compose flows out of already-deployed
-    /// runnables, and makes each of them consume a full author seat instead of half of one.
+    /// runnables, `builder_apps` full-code apps. Either makes each operator consume a full author
+    /// seat instead of half of one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     builder_flows: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    builder_apps: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     manage_schedules: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -11646,9 +11777,10 @@ async fn update_operator_settings(
     require_admin(authed.is_admin, &authed.username)?;
 
     // Every operator of the workspace turns into a full seat, which an offline license may not
-    // cover. It is a no-op delta when the right is already on.
+    // cover. Either right costs the same seat, so this prices "any", and it is a no-op delta when
+    // one of them is already on.
     #[cfg(feature = "enterprise")]
-    if settings.builder_flows == Some(true) {
+    if settings.builder_flows == Some(true) || settings.builder_apps == Some(true) {
         if let Some(msg) =
             windmill_common::ee_oss::check_seat_cap_for_operator_builder(&db, &w_id).await?
         {
@@ -14078,6 +14210,12 @@ const TRIGGER_COMPARE_IGNORE: &[&str] = &[
     "last_server_ping",
     "extra_perms",
     "permissioned_as",
+    // Schedule counters the scheduler bumps as occurrences are missed. A fork's
+    // schedules are disabled so theirs stay at the defaults, and no deploy carries
+    // them across: compared, a parent schedule that ever ran late differs forever.
+    "late_run_streak",
+    "missed_occurrences",
+    "last_missed_at",
     // Server-managed fields that the merge feature treats as workspace-local
     // (regenerated by the deploy handler): GCP `subscription_id` is rewritten
     // to `windmill_<workspace_id>_<path>` in `CreateUpdate` mode, and Azure's
@@ -14399,18 +14537,27 @@ async fn prune_versions(
 
     let pruned = match req.resource_type.as_str() {
         "scripts" => {
-            let result = sqlx::query(
-                "DELETE FROM script
-                WHERE workspace_id = $1 AND hash NOT IN (
-                    SELECT DISTINCT ON (path) hash FROM script
-                    WHERE workspace_id = $1 AND deleted = false
-                    ORDER BY path, created_at DESC
-                )",
-            )
-            .bind(&w_id)
-            .execute(&db)
-            .await?;
-            result.rows_affected()
+            let mut tx = db.begin().await?;
+            let deleted = windmill_common::DeletedScriptVersions::new(
+                &w_id,
+                sqlx::query_as::<_, (String, i64)>(
+                    "DELETE FROM script
+                    WHERE workspace_id = $1 AND hash NOT IN (
+                        SELECT DISTINCT ON (path) hash FROM script
+                        WHERE workspace_id = $1 AND deleted = false
+                        ORDER BY path, created_at DESC
+                    )
+                    RETURNING path, hash",
+                )
+                .bind(&w_id)
+                .fetch_all(&mut *tx)
+                .await?,
+            );
+            deleted.notify(&mut *tx).await?;
+            tx.commit().await?;
+            let pruned = deleted.hashes.len() as u64;
+            deleted.evict();
+            pruned
         }
         "flows" => {
             let deleted = sqlx::query(

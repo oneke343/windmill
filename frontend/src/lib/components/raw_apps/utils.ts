@@ -10,6 +10,7 @@ import { appSourceToDraftValue, normalizeRawAppData } from './rawAppDraftValue'
 
 type RunnableWithInlineScript = RunnableWithFields & {
 	inlineScript?: InlineScript & { language: ScriptLang }
+	viewer_data_access?: boolean
 }
 export type Runnable = RunnableWithInlineScript | undefined
 
@@ -92,6 +93,8 @@ export type RawAppPreviewLogs = {
 	/** Files were sent to the UI Builder and its build has not reported back in time. */
 	buildPending: boolean
 	buildLogs: string
+	/** The app is held back until the user answers its SDK permission prompt, so it is not running. */
+	sdkConsentPending: boolean
 }
 export type RawAppRuntimeLogRequester = (limit: number) => Promise<RawAppPreviewLogs>
 
@@ -236,6 +239,38 @@ export function formatAppRunsForChat(runs: RawAppRunSummary[]): string {
 	return JSON.stringify(runs, null, 2)
 }
 
+/** `sandbox` attribute of a sandbox-isolated app's frame, deployed or in the editor preview. */
+export const RAW_APP_SANDBOX_FLAGS =
+	'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-modals allow-top-navigation'
+
+/** Envelope type for a sandboxed pop-out's relayed messages. */
+export const RAW_APP_PREVIEW_RELAY = 'wm:previewRelay'
+
+/** Where a sandboxed app's (shimmed) localStorage persists, per app. The editor
+ * preview has its own store, so testing in it never touches the deployed app's data. */
+export function rawAppStorageKey(workspace: string, path: string, preview = false): string {
+	return `wm_apps_localstorage:${preview ? 'p:' : ''}${workspace}:${path}`
+}
+
+export function readRawAppStorage(storeKey: string): Record<string, string> {
+	try {
+		return JSON.parse(localStorage.getItem(storeKey) || '{}')
+	} catch (_) {
+		return {}
+	}
+}
+
+/** Applies one `wm_ls_op` relayed by a sandboxed app's storage shim. */
+export function applyRawAppStorageOp(storeKey: string, d: any) {
+	try {
+		const s = readRawAppStorage(storeKey)
+		if (d.op === 'set') s[d.key] = String(d.value)
+		else if (d.op === 'remove') delete s[d.key]
+		else if (d.op === 'clear') for (const k in s) delete s[k]
+		localStorage.setItem(storeKey, JSON.stringify(s))
+	} catch (_) {}
+}
+
 // The sandboxed (isolated) raw-app wrapper is generated server-side and served as
 // a sandboxed, opaque-origin document (see `get_raw_app_data` in the backend
 // `apps.rs`, WIN-2006) — a blob: URL cannot carry the `CSP: sandbox` response
@@ -259,7 +294,9 @@ export function unsandboxedRawAppHtml(
 <html>
 <head>
 	<meta charset="UTF-8" />
-	<title>App</title>
+	<!-- Before the app's own stylesheet, so a bundle that wants a margin can still set one: the
+	     browser default of 8px would otherwise frame every app with a gap it never asked for. -->
+	<style>html, body { margin: 0; }</style>
 	<link rel="stylesheet" href="${baseUrl}/api/w/${workspace}/apps_u/get_data/v/${secret}.css" />
 	<script>
 		window.ctx = ${ctx ? JSON.stringify(ctx).replace(/</g, '\\u003c') : 'undefined'};
@@ -281,6 +318,21 @@ export function unsandboxedRawAppHtml(
 			history.pushState = function () { _ps.apply(this, arguments); notifyParent(); };
 			history.replaceState = function () { _rs.apply(this, arguments); notifyParent(); };
 			setTimeout(notifyParent, 0);
+
+			// The parent shows the app's document.title in its tab. This document has no
+			// <title> of its own: document.title reads the first one, so a placeholder would
+			// shadow the one a framework (React 19, react-helmet) appends.
+			var lastTitle = '';
+			new MutationObserver(function () {
+				var t = document.title;
+				if (t === lastTitle) return;
+				lastTitle = t;
+				try {
+					if (window.parent !== window) {
+						window.parent.postMessage({ type: 'windmill:title', title: t }, '*');
+					}
+				} catch (_) {}
+			}).observe(document.head, { childList: true, subtree: true, characterData: true });
 		})();
 	</script>
 </head>

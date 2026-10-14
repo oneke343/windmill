@@ -1523,6 +1523,9 @@
 		} catch (e) {
 			console.log('error initializing services', e)
 		}
+		// Unmounted while the services loaded: the container is detached, and
+		// creating the editor on it throws.
+		if (destroyed || !divEl?.isConnected) return
 
 		// vscode.languages.registerDefinitionProvider('*', {
 		// 	provideDefinition(document, position, token) {
@@ -1831,9 +1834,15 @@
 				scriptLang === 'bunnative' ||
 				scriptLang === 'nativets')
 		) {
-			const resourceTypes = await ResourceService.listResourceType({
-				workspace: $operatingWorkspace ?? ''
-			})
+			// The generated client resolves `undefined` for any response whose body it
+			// cannot read — `getResponseBody` swallows a parse failure and returns
+			// nothing, which `catchErrorCodes` passes through on a 2xx. Typing says
+			// otherwise, so without this the editor dies on mount rather than losing
+			// its resource-type autocomplete.
+			const resourceTypes =
+				(await ResourceService.listResourceType({
+					workspace: $operatingWorkspace ?? ''
+				})) ?? []
 
 			const namespace = formatResourceTypes(
 				resourceTypes,

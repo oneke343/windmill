@@ -1,6 +1,7 @@
 <script lang="ts">
 	import SimpleEditor from '$lib/components/SimpleEditor.svelte'
-	import { createEventDispatcher, untrack } from 'svelte'
+	import { createEventDispatcher, onDestroy, untrack } from 'svelte'
+	import { setEditorUnparseable } from './pendingEditorFlush'
 
 	const dispatch = createEventDispatcher()
 
@@ -12,13 +13,18 @@
 		 * payload nobody has typed into tracks the schema instead of going stale. The first edit
 		 * hands the buffer to the user and later changes stop overwriting it. */
 		initialCode?: string
+		/** Show the payload without taking edits. For a caller that must keep this editor
+		 * mounted while refusing writes: swapping it for the fields instead would mount the
+		 * widgets, and a `password` field mints a variable from whatever literal it opens on. */
+		readOnly?: boolean
 	}
 
 	let {
 		updateOnBlur = true,
 		placeholder = 'Write a JSON payload. The input schema will be inferred.<br/><br/>Example:<br/><br/>{<br/>&nbsp;&nbsp;"foo": "12"<br/>}',
 		selected = false,
-		initialCode = ''
+		initialCode = '',
+		readOnly = false
 	}: Props = $props()
 
 	let pendingJson = $state(untrack(() => initialCode))
@@ -31,6 +37,19 @@
 	let userEdited = false
 	let simpleEditor: SimpleEditor | undefined = $state(undefined)
 	let focusTrap: HTMLElement | undefined = $state()
+	let parseError = $state('')
+
+	// Text that does not parse dispatches `undefined`, which callers read as "keep the last args":
+	// registering it lets whoever runs or persists those args refuse instead of using stale ones.
+	const unparseableKey = {}
+	onDestroy(() => setEditorUnparseable(unparseableKey, false))
+
+	let rootEl: HTMLElement | undefined = $state()
+
+	function setParseError(message: string) {
+		parseError = message
+		setEditorUnparseable(unparseableKey, message !== '', rootEl)
+	}
 
 	$effect(() => {
 		const next = initialCode
@@ -48,17 +67,21 @@
 		userEdited = false
 		pendingJson = code
 		simpleEditor?.setCode(code)
+		setParseError('')
 	}
 
 	function updatePayloadFromJson(jsonInput: string) {
 		if (jsonInput === undefined || jsonInput === null || jsonInput.trim() === '') {
+			setParseError('')
 			dispatch('select', undefined)
 			return
 		}
 		try {
 			const parsed = JSON.parse(jsonInput)
+			setParseError('')
 			dispatch('select', parsed)
 		} catch (error) {
+			setParseError(error instanceof Error ? error.message : String(error))
 			dispatch('select', undefined)
 		}
 	}
@@ -88,31 +111,37 @@
 <!-- Add a hidden button that can receive focus -->
 <button bind:this={focusTrap} class="sr-only" tabindex="-1" aria-hidden="true">Focus trap</button>
 
-<div class="h-full rounded-md border">
-	<SimpleEditor
-		bind:this={simpleEditor}
-		on:input={() => (userEdited = true)}
-		on:focus={() => {
-			if (updateOnBlur) {
-				dispatch('focus')
-				updatePayloadFromJson(pendingJson)
-			}
-		}}
-		on:blur={async () => {
-			if (updateOnBlur) {
-				dispatch('blur')
-			}
-		}}
-		on:change={(e) => {
-			if (e.detail?.code !== undefined) {
-				updatePayloadFromJson(e.detail.code)
-			}
-		}}
-		bind:code={pendingJson}
-		lang="json"
-		class="h-full json-inputs-editor"
-		{placeholder}
-	/>
+<div bind:this={rootEl} class="h-full flex flex-col">
+	<div class="flex-1 min-h-0 rounded-md border">
+		<SimpleEditor
+			bind:this={simpleEditor}
+			on:input={() => (userEdited = true)}
+			on:focus={() => {
+				if (updateOnBlur) {
+					dispatch('focus')
+					updatePayloadFromJson(pendingJson)
+				}
+			}}
+			on:blur={async () => {
+				if (updateOnBlur) {
+					dispatch('blur')
+				}
+			}}
+			on:change={(e) => {
+				if (e.detail?.code !== undefined) {
+					updatePayloadFromJson(e.detail.code)
+				}
+			}}
+			bind:code={pendingJson}
+			lang="json"
+			class="h-full json-inputs-editor"
+			{readOnly}
+			{placeholder}
+		/>
+	</div>
+	{#if parseError}
+		<span class="text-red-600 dark:text-red-400 text-xs mt-1">Invalid JSON: {parseError}</span>
+	{/if}
 </div>
 
 <style>

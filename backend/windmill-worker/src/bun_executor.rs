@@ -21,8 +21,8 @@ use crate::{
     common::{
         build_command_with_isolation, create_args_and_out_file, get_reserved_variables,
         parse_npm_config, read_file, read_file_content, read_result, resolve_nsjail_timeout,
-        resolve_nsjail_tmp_mount_block, start_child_process, write_file_binary, MaybeLock,
-        OccupancyMetrics, StreamNotifier, DEV_CONF_NSJAIL,
+        resolve_nsjail_tmp_mount_block, script_envars, start_child_process, write_file_binary,
+        MaybeLock, OccupancyMetrics, StreamNotifier, DEV_CONF_NSJAIL,
     },
     get_proxy_envs_for_lang,
     handle_child::handle_child,
@@ -2362,7 +2362,11 @@ try {{
 
         #[cfg(feature = "deno_core")]
         {
-            let env_code = build_nativets_env_code(base_internal_url, &reserved_variables);
+            let env_code = build_nativets_env_code(
+                base_internal_url,
+                &reserved_variables,
+                annotation.no_network,
+            );
             let js_code = read_file_content(&format!("{job_dir}/main.js")).await?;
             let started_at = Instant::now();
             let args = crate::common::build_args_map(job, client, conn)
@@ -2470,35 +2474,6 @@ try {{
     let child = if is_sandboxing_enabled() || annotation.sandbox {
         let nsjail_timeout =
             resolve_nsjail_timeout(conn, &job.workspace_id, job.id, job.timeout).await;
-        let _ = write_file(
-            job_dir,
-            "run.config.proto",
-            &NSJAIL_CONFIG_RUN_BUN_CONTENT
-                .replace("{LANG}", if annotation.nodejs { "nodejs" } else { "bun" })
-                .replace("{JOB_DIR}", job_dir)
-                .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
-                .replace("{UIDGIDMAP}", if *DISABLE_NUSER { "" } else {
-                    "uidmap {\n    inside_id: \"1000\"\n    outside_id: \"\"\n    count: 1\n}\n\ngidmap {\n    inside_id: \"1000\"\n    outside_id: \"\"\n    count: 1\n}"
-                })
-                .replace(
-                    "{SHARED_MOUNT}",
-                    &shared_mount.replace(
-                        "/tmp/shared",
-                        if annotation.nodejs {
-                            "/tmp/nodejs/shared"
-                        } else {
-                            "/tmp/bun/shared"
-                        },
-                    ),
-                )
-                .replace("{TRACING_PROXY_CA_CERT_PATH}", &*TRACING_PROXY_CA_CERT_PATH)
-                .replace("#{DEV}", DEV_CONF_NSJAIL)
-                .replace(
-                    "{TMP_MOUNT_BLOCK}",
-                    &resolve_nsjail_tmp_mount_block(job_dir).await,
-                )
-                .replace("{TIMEOUT}", &nsjail_timeout),
-        )?;
 
         let mut nsjail_cmd = Command::new(NSJAIL_PATH.as_str());
         let args = if annotation.nodejs {
@@ -2537,7 +2512,6 @@ try {{
         nsjail_cmd
             .current_dir(job_dir)
             .env_clear()
-            .envs(envs)
             .envs(reserved_variables)
             .envs(
                 get_proxy_envs_for_lang(
@@ -2554,6 +2528,36 @@ try {{
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let _ = write_file(
+            job_dir,
+            "run.config.proto",
+            &NSJAIL_CONFIG_RUN_BUN_CONTENT
+                .replace("{LANG}", if annotation.nodejs { "nodejs" } else { "bun" })
+                .replace("{JOB_DIR}", job_dir)
+                .replace("{CLONE_NEWUSER}", &(!*DISABLE_NUSER).to_string())
+                .replace("{UIDGIDMAP}", if *DISABLE_NUSER { "" } else {
+                    "uidmap {\n    inside_id: \"1000\"\n    outside_id: \"\"\n    count: 1\n}\n\ngidmap {\n    inside_id: \"1000\"\n    outside_id: \"\"\n    count: 1\n}"
+                })
+                .replace(
+                    "{SHARED_MOUNT}",
+                    &shared_mount.replace(
+                        "/tmp/shared",
+                        if annotation.nodejs {
+                            "/tmp/nodejs/shared"
+                        } else {
+                            "/tmp/bun/shared"
+                        },
+                    ),
+                )
+                .replace("{TRACING_PROXY_CA_CERT_PATH}", &*TRACING_PROXY_CA_CERT_PATH)
+                .replace("#{DEV}", DEV_CONF_NSJAIL)
+                .replace(
+                    "{TMP_MOUNT_BLOCK}",
+                    &resolve_nsjail_tmp_mount_block(job_dir).await,
+                )
+                .replace("{TIMEOUT}", &nsjail_timeout)
+                .replace("{ENVARS}", &script_envars(&envs, &nsjail_cmd, &[])),
+        )?;
         start_child_process(nsjail_cmd, NSJAIL_PATH.as_str(), false).await?
     } else {
         let cmd = if annotation.nodejs {
@@ -2892,6 +2896,9 @@ pub async fn handle_wac_v2_output(
                             concurrency_settings: ConcurrencySettings::default(),
                             debouncing_settings: DebouncingSettings::default(),
                             labels: None,
+                            // Capped by the parent at push, which already holds this
+                            // script's setting.
+                            job_token_scopes: None,
                         })
                     } else {
                         Err(error::Error::internal_err(
@@ -3019,6 +3026,7 @@ pub async fn handle_wac_v2_output(
                             apply_preprocessor: false,
                             version: flow_info.version,
                             labels: flow_info.labels.clone(),
+                            job_token_scopes: flow_info.job_token_scopes.clone(),
                         };
                         let on_behalf_of = flow_info.on_behalf_of(&job.workspace_id, db).await?;
                         (ChildRunnable::Deployed(payload), on_behalf_of)
@@ -3265,9 +3273,10 @@ pub async fn handle_wac_v2_output(
                             .or(if own_runnable { None } else { job.priority }),
                         None,  // authed
                         false, // running
-                        None,  // end_user_email
-                        None,  // trigger
-                        None,  // suspended_mode
+                        job.permissioned_as_end_user_email.clone(),
+                        None, // trigger
+                        None, // suspended_mode
+                        job.job_token_scopes.as_deref(),
                     )
                     .await?;
 
@@ -3722,7 +3731,10 @@ pub async fn handle_wac_v2_output(
             // status row, the order every child completion takes.
             let segment_ms = sqlx::query_scalar!(
                 "WITH prev AS (SELECT started_at FROM v2_job_queue WHERE id = $1)
-                 UPDATE v2_job_queue q SET running = false, started_at = null
+                 UPDATE v2_job_queue q SET running = false, started_at = null,
+                     extras = CASE WHEN q.started_at IS NULL OR q.extras ? 'wac_first_started_at' THEN q.extras
+                         ELSE jsonb_set(COALESCE(q.extras, '{}'::jsonb), '{wac_first_started_at}', to_jsonb(q.started_at))
+                     END
                  FROM prev WHERE q.id = $1
                  RETURNING (extract(epoch FROM now() - prev.started_at) * 1000)::bigint",
                 job.id,
@@ -3807,11 +3819,15 @@ pub async fn get_common_bun_proc_envs(base_internal_url: Option<&str>) -> HashMa
 pub fn build_nativets_env_code(
     base_internal_url: &str,
     reserved_variables: &HashMap<String, String>,
+    no_network: bool,
 ) -> String {
     format!(
         "const process = {{ env: {{}} }};\nconst BASE_URL = '{base_internal_url}';\nconst BASE_INTERNAL_URL = '{base_internal_url}';\nprocess.env['BASE_URL'] = BASE_URL;process.env['BASE_INTERNAL_URL'] = BASE_INTERNAL_URL;\n{}",
         reserved_variables
             .iter()
+            // Useless without network, and a `//no_network` script could still
+            // hand it out through its result to whoever authored it.
+            .filter(|(k, _)| !(no_network && k.as_str() == "WM_TOKEN"))
             .map(|(k, v)| {
                 // The key is attacker-controllable (custom workspace env vars), so
                 // escape it as a string literal too, not just the value.
@@ -4070,6 +4086,7 @@ async fn handle_dedicated_bunnative(
                             result,
                             result_columns: None,
                             mem_peak: 0,
+                            resource_usage: None,
                             canceled_by: None,
                             success,
                             cached_res_path: None,
@@ -4206,7 +4223,11 @@ pub async fn start_worker(
             .iter()
             .map(|x| (x.name.clone(), x.value.clone()))
             .collect();
-        let env_code = build_nativets_env_code(base_internal_url, &reserved_variables);
+        let env_code = build_nativets_env_code(
+            base_internal_url,
+            &reserved_variables,
+            annotation.no_network,
+        );
 
         return handle_dedicated_bunnative(
             inner_content,

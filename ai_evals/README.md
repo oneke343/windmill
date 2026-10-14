@@ -89,7 +89,21 @@ Notes:
 
 - the command also prints accepted alias spellings such as `gpt-4o`, `gpt-55`, `claude-opus-4.6`, and `claude-haiku-4.5`
 - frontend modes (`flow`, `script`, `app`, `global`) can use Anthropic, OpenAI, Gemini, and DeepSeek-backed aliases
-- `cli` mode always uses the Anthropic agent SDK, so only Anthropic aliases are valid there
+- `cli` mode runs a coding agent over the workspace, chosen by the alias's `cli` entry; aliases without one are rejected there:
+
+  | Agent | Models | Label | Needs |
+  | --- | --- | --- | --- |
+  | Claude Code (`@anthropic-ai/claude-agent-sdk`) | Claude aliases | `anthropic:<model>` | `ANTHROPIC_API_KEY` |
+  | Claude Code on DeepSeek's Anthropic-compatible endpoint | `deepseek-v4-pro` | `claude-code:<model>` | `DEEPSEEK_API_KEY` |
+  | Codex (`codex exec --json`) | `gpt-6.1-sol`, `gpt-6-astra` | `codex:<model>` | `codex` on `PATH` (CI pins 0.159.3), `OPENAI_API_KEY` |
+
+  Codex runs with a throwaway `HOME`, so your own `~/.codex` config and skills stay out of the run. It has no
+  Skill tool: it finds `.agents/skills` on its own and loads a skill by reading its `SKILL.md`, so the trace
+  records any command that touches `.agents/skills/<name>/SKILL.md` as a `Skill` call to `<name>`, just
+  before that command, or just after it when the command mutates something before reading the skill. Its shell commands are recorded as `Bash` and its patches as `Edit`, so the
+  `invokes skill … before first mutation` checks compare the same things for both agents. Codex has no
+  turn cap; a run stops at `maxTurns` rounds of tool calls (parallel calls count once) and fails, as a
+  Claude Code run does at its cap.
 - the judge model is separate and currently defaults to `claude-sonnet-5-5`; use `--skip-judge` for deterministic-only runs
 
 ## Case Format
@@ -164,6 +178,12 @@ the decrypted value, exactly as against a real backend. The chat's read path pas
 Seed a recognizable secret (the existing fixture uses `sk_live_do_not_leak_me`) and
 assert it via `valueExcludes` to catch a leak.
 
+`runtime.userAnswers` scripts the user's side of `askUserQuestion` in a global case: one
+answer per question, in the order they are asked, and a question past the last answer is
+dismissed, so `userAnswers: []` dismisses every question. Without it the tool reports that
+it cannot ask, and the model usually carries on with its own guess, which makes "asks
+before creating anything" impossible to assert.
+
 `toolExpect.toolCallArgs` entries support `sharedByAtLeast: <n>`: at least `n` recorded
 calls to that tool must carry the same non-blank string in the field. Use it for calls that
 have to share an identifier, like two test runs of one chat conversation.
@@ -176,7 +196,10 @@ not have read is itself the failure — e.g. `write_variable.value` on a secret 
 Global (and flow) initial fixtures can seed `workspace.datatables` so the
 `list_datatables`, `get_datatable_table_schema`, and `exec_datatable_sql` tools
 return seeded data during evals. Each entry is
-`{ datatable_name, schemas: { <schema>: { <table>: { columns, rows? } } } }`.
+`{ datatable_name, schemas: { <schema>: { <table>: { columns, rows? } } } }`,
+plus `migrations_enabled: true` and `migrations: [{ timestamp, name, code_up, code_down?, applied? }]`
+for a datatable that keeps its schema as migrations, which the migration tools then
+read and write in memory.
 SQL runs through a small in-memory engine (`datatableSqlEngine.ts`), not a real
 database. Writes are **stateful within a case**: `CREATE`/`DROP`/`INSERT`/`UPDATE`/
 `DELETE` mutate the seeded datatable in place, so a later `list_datatables`,

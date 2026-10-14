@@ -3,9 +3,12 @@
 ## General Principles
 
 - A script's inputs are its parameters. Credentials and configuration come in as resource-typed parameters, never hard-coded or read from the environment; the language section below shows how that language declares parameters
+- When no resource type exists for a service, still take its connection as one resource-typed parameter, of a custom type holding the connection fields (base URL, account identifiers, credentials), its secret in a variable the resource references. A custom type is named `c_<name>`, which keeps it apart from a hub type synced later: the parameter takes `RT.C<Name>` in TypeScript, a `c_<name>` TypedDict in Python. A plain string parameter or a variable read inside the code only when the user asks for it: the resource keeps a connection's fields together, lets whoever runs the script pick an existing connection, and keeps the secret out of the arguments a run records. If the instance is reported as not having synced the Windmill Hub's resource types, mention that a superadmin can sync them, since the hub has types for most services. Otherwise, or when the user prefers it to syncing, propose the resource type and ask before creating it
+- A Windmill Hub script takes a resource type the hub publishes, so on an instance that has not synced the hub's types that type is missing: say so, and that a superadmin can sync them, before asking for a resource of it. Hub scripts often declare the type inline (`type Stripe = { token: string }`), which is still the `stripe` resource type; in code you write, name it the way the language section shows (`RT.Stripe` in TypeScript) rather than copying the inline declaration
 - Libraries are installed automatically - do not show installation instructions
 - In a language with an entrypoint function (TypeScript, Python, Go, Rust, PHP, R, …), name it `main` (`Main` in C#) and do not call it; in TypeScript it must be async. SQL, GraphQL, Bash, PowerShell and Ansible scripts have no `main`: their language section shows how they take arguments
 - Where the language has a Windmill client (`wmill`), use it to interact with the platform
+- A script's input schema may carry a top-level `prompt_for_ai` string: its author's instructions to an AI choosing the inputs. Follow it when you pick arguments to run that script, and keep it when you rewrite the schema
 
 ## Return Values
 
@@ -371,6 +374,18 @@ Only use resource types if you need them to satisfy the instructions. Always use
 export async function main(url: string) {
   const response = await fetch(url);
   return await response.json();
+}
+```
+
+## Pure computation: `//no_network`
+
+A native script that only transforms its inputs can declare `//no_network` in its leading comment block (right after `//native`). The runtime then refuses every connection the script attempts: `fetch` to any host, the Windmill API (so `windmill-client` calls fail too), raw sockets and unix sockets, and `WM_TOKEN` is not set. It only takes effect on native scripts: without `//native` it is ignored. Use it only when the script needs no external data beyond its arguments:
+
+```typescript
+//native
+//no_network
+export async function main(items: { price: number; qty: number }[]) {
+  return items.reduce((sum, i) => sum + i.price * i.qty, 0);
 }
 ```
 
@@ -1396,6 +1411,27 @@ Name the parameters by adding comments before the statement:
 SELECT * FROM users WHERE name = ? AND age > ?;
 ```
 
+## Array parameters
+
+Declare a list with a `[]` suffix on the element type (`(varchar[])`,
+`(int[])`), or `(array)` for an untyped one. Snowflake cannot bind an array
+directly, so Windmill binds the list as JSON text: wrap the placeholder with
+`PARSE_JSON(?)`, and cast to `ARRAY` where a function expects one.
+
+```sql
+-- ? groups (varchar[])
+SELECT o.* FROM orders o
+WHERE ARRAY_CONTAINS(o.owner_group::VARIANT, PARSE_JSON(?)::ARRAY);
+```
+
+Or join on the elements with `FLATTEN`:
+
+```sql
+-- ? groups (varchar[])
+SELECT o.* FROM orders o
+JOIN TABLE(FLATTEN(input => PARSE_JSON(?))) g ON g.value::STRING = o.owner_group;
+```
+
 ## Receiving an S3Object as a script parameter
 
 Declare the arg with type `(s3object)`. Windmill renders an S3 file picker for
@@ -1554,21 +1590,23 @@ async cancelJob(jobId: string, reason: string | undefined = undefined): Promise<
  * Run a script asynchronously by its path
  * @param path - Script path in Windmill
  * @param args - Arguments to pass to the script
- * @param scheduledInSeconds - Schedule execution for a future time (in seconds)
+ * @param scheduledInSeconds - Schedule execution for a future time (in seconds), or {@link RunScriptAsyncOptions}
+ *   `{ scheduledInSeconds?, tag?, retry? }`, e.g. `{ retry: { constant: { attempts: 3, seconds: 10 } } }`
  * @param tag - Override the worker tag the job runs on
  * @returns Job ID of the created job
  */
-async runScriptByPathAsync(path: string, args: Record<string, any> | null = null, scheduledInSeconds: number | null = null, tag: string | null = null): Promise<string>
+async runScriptByPathAsync(path: string, args: Record<string, any> | null = null, scheduledInSeconds: number | null | RunScriptAsyncOptions = null, tag: string | null = null): Promise<string>
 
 /**
  * Run a script asynchronously by its hash
  * @param hash_ - Script hash in Windmill
  * @param args - Arguments to pass to the script
- * @param scheduledInSeconds - Schedule execution for a future time (in seconds)
+ * @param scheduledInSeconds - Schedule execution for a future time (in seconds), or {@link RunScriptAsyncOptions}
+ *   `{ scheduledInSeconds?, tag?, retry? }`, e.g. `{ retry: { constant: { attempts: 3, seconds: 10 } } }`
  * @param tag - Override the worker tag the job runs on
  * @returns Job ID of the created job
  */
-async runScriptByHashAsync(hash_: string, args: Record<string, any> | null = null, scheduledInSeconds: number | null = null, tag: string | null = null): Promise<string>
+async runScriptByHashAsync(hash_: string, args: Record<string, any> | null = null, scheduledInSeconds: number | null | RunScriptAsyncOptions = null, tag: string | null = null): Promise<string>
 
 /**
  * Run a flow asynchronously by its path
@@ -1623,6 +1661,14 @@ async setProgress(percent: number, jobId?: any): Promise<void>
  * @returns Optional clamped between 0 and 100 progress value
  */
 async getProgress(jobId?: any): Promise<number | null>
+
+/**
+ * Whether the worker running this job has received its shutdown signal.
+ * A draining worker waits for its current job to finish before exiting, so a
+ * long-running script can poll this and return early to let the worker be replaced.
+ * @param jobId? Job to check, defaults to the current job
+ */
+async workerIsDraining(jobId?: string): Promise<boolean>
 
 /**
  * Set a flow user state
@@ -1883,6 +1929,9 @@ async sleep(seconds: number): Promise<void>
  * `fn`'s result is encoded as JSON and decoded back before it is returned, so
  * the round that runs the body sees the same types every replay sees: a `Date`
  * comes back as a string, a `Map` as `{}`. {@link Jsonified} is that shape.
+ * 
+ * Called from inside a task body, `fn` runs in place and nothing is
+ * checkpointed: a task is a single job and is never replayed.
  */
 async step<T>(name: string, fn: () => T | Promise<T>,): Promise<Jsonified<Awaited<T>>>
 
@@ -2116,10 +2165,14 @@ def post(endpoint, raise_for_status = True, **kwargs) -> httpx.Response
 def create_token(duration = dt.timedelta(days=1)) -> str
 
 # Create a script job by path and return its job id.
-def run_script_by_path_async(path: str, args: dict = None, scheduled_in_secs: int = None, tag: str = None) -> str
+# 
+# ``retry`` re-runs the job when it fails, with the policy a schedule takes,
+# e.g. ``{"constant": {"attempts": 3, "seconds": 10}}``. The returned id is
+# the first attempt's; each retry is a job of its own, recorded as a child of it.
+def run_script_by_path_async(path: str, args: dict = None, scheduled_in_secs: int = None, tag: str = None, retry: dict = None) -> str
 
-# Create a script job by hash and return its job id.
-def run_script_by_hash_async(hash_: str, args: dict = None, scheduled_in_secs: int = None, tag: str = None) -> str
+# Create a script job by hash and return its job id. See ``run_script_by_path_async`` for ``retry``.
+def run_script_by_hash_async(hash_: str, args: dict = None, scheduled_in_secs: int = None, tag: str = None, retry: dict = None) -> str
 
 # Create a flow job and return its job id.
 def run_flow_async(path: str, args: dict = None, scheduled_in_secs: int = None, do_not_track_in_parent: bool = True, tag: str = None) -> str
@@ -2291,6 +2344,18 @@ def set_progress(value: int, job_id: Optional[str] = None)
 # Returns:
 #     Progress value (0-100) or None if not set
 def get_progress(job_id: Optional[str] = None) -> Any
+
+# Whether the worker running the job has received its shutdown signal.
+# 
+# A draining worker waits for its current job to finish before exiting. A long-running
+# script can poll this and return early so the worker can be replaced.
+# 
+# Args:
+#     job_id: Job ID (defaults to current WM_JOB_ID)
+# 
+# Returns:
+#     True if the worker running the job is draining
+def worker_is_draining(job_id: Optional[str] = None) -> bool
 
 # Set the user state of a flow at a given key
 def set_flow_user_state(key: str, value: Any) -> None
@@ -2709,7 +2774,9 @@ def parse_sql_client_name(name: str) -> tuple[str, Optional[str]]
 # 
 # - **v2 (inside @workflow)**: dispatches as a checkpoint step.
 # - **v1 (WM_JOB_ID set, no @workflow)**: dispatches via HTTP API.
-# - **Standalone**: executes the function body directly.
+# - **Standalone, or called from inside another v2 task**: executes the
+#   function body directly. A task runs as a single job, so the tasks it
+#   calls run in that same job, without their own options.
 # 
 # A task runs as its own job, so its result is always encoded as JSON and
 # decoded back before the caller sees it: a ``datetime`` comes back as a
@@ -2795,12 +2862,15 @@ def workflow(func)
 # ``fn``'s result is encoded as JSON and decoded back before it is returned,
 # so the round that runs the body sees the same types every replay sees:
 # a ``datetime`` comes back as a string, a tuple as a list.
+# 
+# Called from inside a task body, ``fn`` runs in place and nothing is
+# checkpointed: a task is a single job and is never replayed.
 async def step(name: str, fn)
 
 # Server-side sleep — suspend the workflow for the given duration without holding a worker.
 # 
 # Inside a @workflow, the parent job suspends and auto-resumes after ``seconds``.
-# Outside a workflow, falls back to ``asyncio.sleep``.
+# Outside a workflow, or inside a task body, falls back to ``asyncio.sleep``.
 async def sleep(seconds: int)
 
 # Suspend the workflow and wait for an external approval.

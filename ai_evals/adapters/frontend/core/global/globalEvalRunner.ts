@@ -13,6 +13,7 @@ import {
   getGlobalDraft,
   listGlobalDrafts,
 } from "../../../../../frontend/src/lib/components/copilot/chat/global/userDraftAdapter";
+import { resolveResourceTypeSync } from "../../../../../frontend/src/lib/components/copilot/chat/script/core";
 import { appendPlanModeInstructions } from "../../../../../frontend/src/lib/components/copilot/chat/planMode";
 import type { Tool as ProductionTool } from "../../../../../frontend/src/lib/components/copilot/chat/shared";
 import { createEvalPlanTools } from "./planModeTools";
@@ -123,6 +124,7 @@ export interface GlobalEvalOptions {
   planMode?: boolean;
   model?: string;
   maxIterations?: number;
+  userAnswers?: string[];
   provider?: AIProvider;
   backend: WindmillBackendSettings;
   workspaceRoot?: string;
@@ -201,6 +203,7 @@ export async function runGlobalEval(
       userMessage: prepareGlobalUserMessage(userPrompt, [], {
         ...(injectActiveEditorContext ? { workspace: workspaceRoot } : {}),
         activePreview: panel?.activePreview(),
+        resourceTypeSync: await resolveResourceTypeSync(workspaceRoot, []),
       }),
       tools: [
         ...getGlobalEvalTools(options.sessionChat ?? false),
@@ -220,6 +223,7 @@ export async function runGlobalEval(
       onToolCall: options.runContext?.onToolCall,
       options: {
         maxIterations: options.maxIterations,
+        userAnswers: options.userAnswers,
         model,
         workspace: workspaceRoot,
         provider: options.provider,

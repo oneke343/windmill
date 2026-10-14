@@ -12,7 +12,7 @@
 	import type { Schema } from '$lib/common'
 	import type { InputCat, DynamicInput as DynamicInputTypes } from '$lib/utils'
 	import { createEventDispatcher, getContext, onDestroy, untrack, type Snippet } from 'svelte'
-	import { computeShow } from '$lib/utils'
+	import { computeShow, quickjsSettled } from '$lib/utils/quickjsEval.svelte'
 
 	import ArgInput from './ArgInput.svelte'
 	import FieldHeader from './FieldHeader.svelte'
@@ -105,6 +105,8 @@
 		pickableProperties?: PickableProperties | undefined
 		enableAi?: boolean
 		hideHelpButton?: boolean
+		/** A footnote under the input, sharing the Help toggle's row when there is one. */
+		hint?: string
 		class?: string
 		editor?: SimpleEditor | undefined
 		otherArgs?: Record<string, InputTransform>
@@ -150,6 +152,7 @@
 		pickableProperties = undefined,
 		enableAi = false,
 		hideHelpButton = false,
+		hint = undefined,
 		class: className = '',
 		editor = $bindable(undefined),
 		otherArgs = {},
@@ -479,8 +482,9 @@
 				contextArgs[key] = otherArgValue
 			})
 
-			const shouldShow = computeShow(argName, schemaProperty.showExpr, contextArgs)
-			if (shouldShow || hasJavascript) {
+			const shouldShow = hasJavascript || computeShow(schemaProperty.showExpr, contextArgs)
+			if (shouldShow === undefined) return
+			if (shouldShow) {
 				hidden = false
 			} else if (!hidden) {
 				hidden = true
@@ -596,6 +600,7 @@
 		JSON.stringify(schema)
 		JSON.stringify(arg)
 		JSON.stringify(otherArgs)
+		quickjsSettled()
 
 		untrack(() => handleFieldVisibility(schema, arg, otherArgs))
 	})
@@ -905,7 +910,9 @@
 					     step-input autocompletion (ghost text, accepted with Tab) doesn't
 					     hide the Help dropdown — the two stay independent. -->
 						{#if !hideHelpButton && propertyType === 'javascript' && argKind === 'javascript' && arg.expr != undefined}
-							<DynamicInputHelpBox />
+							<DynamicInputHelpBox {hint} />
+						{:else if hint}
+							<p class="mt-1 text-2xs text-hint">{hint}</p>
 						{/if}
 
 						{#snippet innerInput()}

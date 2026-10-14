@@ -17,6 +17,7 @@ use crate::workspaces::{
 
 use axum::{
     extract::{Extension, Path, Query},
+    http::StatusCode,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -235,6 +236,7 @@ async fn run_datatable_migration_job(
     args.insert("database".to_string(), database_arg.clone());
     let push_args = PushArgs { extra: None, args: &args };
 
+    let scope_ceiling = windmill_api_auth::caller_scope_ceiling(db, authed).await?;
     let (uuid, mut tx) = push(
         db,
         PushIsolationLevel::Isolated(user_db.clone(), authed.clone().into()),
@@ -278,6 +280,7 @@ async fn run_datatable_migration_job(
         None,
         None,
         None,
+        scope_ceiling.as_deref(),
     )
     .await?;
 
@@ -401,6 +404,12 @@ async fn connection_identity(client: &tokio_postgres::Client) -> Option<(String,
     })
 }
 
+const MIGRATION_LOCK_KEY: &str = "hashtext('windmill_datatable_migrations')::int8";
+
+/// How long a run, rollback or edit waits for the one ahead of it. A migration may run for
+/// longer than any request should wait, so past this the caller is told to retry.
+const MIGRATION_LOCK_WAIT_SECS: u64 = 30;
+
 /// Open a connection to a data table's own database and hold the session-level
 /// advisory lock that serializes migration runs/rollbacks. The lock is released
 /// when the returned client is dropped, so callers must keep it in scope for the
@@ -426,16 +435,204 @@ async fn lock_datatable_migration_runs(
             tracing::error!("Datatable connection error: {}", e);
         }
     });
+    hold_migration_lock(&client, datatable_name, MIGRATION_LOCK_WAIT_SECS).await?;
+    Ok(client)
+}
+
+async fn hold_migration_lock(
+    client: &tokio_postgres::Client,
+    datatable_name: &str,
+    wait_secs: u64,
+) -> Result<()> {
+    // A session whose client vanished without closing the socket otherwise keeps the lock for
+    // the server's keepalive default, two hours on Linux. `SET` rather than startup `options`,
+    // which PgBouncer rejects. Behind a pooler they only cover the pooler's own connection to
+    // the server: there, as on a server refusing them, the bounded wait below is the recovery.
+    if let Err(e) = client
+        .batch_execute(
+            "SET tcp_keepalives_idle = 60; SET tcp_keepalives_interval = 10; \
+             SET tcp_keepalives_count = 6",
+        )
+        .await
+    {
+        tracing::debug!(
+            "Could not set server keepalives on the migration lock connection: {}",
+            pg_error_message(&e)
+        );
+    }
+    let locked = client
+        .batch_execute(&format!(
+            "SET lock_timeout = '{wait_secs}s'; \
+             SELECT pg_advisory_lock({MIGRATION_LOCK_KEY}); \
+             RESET lock_timeout"
+        ))
+        .await;
+    match locked {
+        Ok(()) => Ok(()),
+        Err(e) if e.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) => {
+            // The key as `pg_locks` splits it: high half in `classid`, low half in `objid`.
+            let holder = client
+                .query_opt(
+                    &format!(
+                        "SELECT pid FROM pg_locks
+                         WHERE locktype = 'advisory' AND granted AND objsubid = 1
+                           AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                           AND ((classid::bigint << 32) | objid::bigint) = {MIGRATION_LOCK_KEY}"
+                    ),
+                    &[],
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|row| row.get::<_, i32>(0));
+            let held_by = match holder {
+                Some(pid) => format!(
+                    " The lock is held by backend pid {pid}: if nothing is running, a lost \
+                     connection left that session behind, and \
+                     `SELECT pg_terminate_backend({pid})` on the data table's database releases it."
+                ),
+                None => String::new(),
+            };
+            Err(Error::Generic(
+                StatusCode::CONFLICT,
+                format!(
+                    "Another migration run, rollback or edit on the database of data table \
+                     '{datatable_name}' was still in progress after {wait_secs}s. \
+                     Retry once it is done.{held_by}"
+                ),
+            ))
+        }
+        Err(e) => Err(Error::internal_err(format!(
+            "Failed to acquire migration lock: {}",
+            pg_error_message(&e)
+        ))),
+    }
+}
+
+/// The `_wm_migrations` rows of a database a schema-only copy is being made of, read with
+/// [`lock_migration_runs_on`] held so they describe the schema the dump captured.
+pub(crate) struct AppliedMigrations {
+    /// `None` when the source has no `_wm_migrations`.
+    schema: Option<String>,
+    datatables: Vec<String>,
+    versions: Vec<i64>,
+    installed_at: Vec<String>,
+}
+
+/// Hold the migration-run lock on database `pg`, for a copy whose schema has to agree with the
+/// `_wm_migrations` rows it carries. The lock is per database, whichever data table names it.
+pub(crate) async fn lock_migration_runs_on(
+    db: &DB,
+    pg: &PgDatabase,
+    label: &str,
+) -> Result<tokio_postgres::Client> {
+    let (client, connection) = pg.connect(Some(db)).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::error!("Datatable connection error: {}", e);
+        }
+    });
+    hold_migration_lock(&client, label, MIGRATION_LOCK_WAIT_SECS).await?;
+    Ok(client)
+}
+
+/// Read every `_wm_migrations` row of the database `client` is connected to, along with the
+/// schema the table is in: the copy is written to by a connection whose `search_path` need not
+/// resolve the way this one does.
+pub(crate) async fn read_applied_migrations(
+    client: &tokio_postgres::Client,
+) -> Result<AppliedMigrations> {
+    let read_err = |e: tokio_postgres::Error| {
+        Error::internal_err(format!(
+            "Failed to read _wm_migrations: {}",
+            pg_error_message(&e)
+        ))
+    };
+    let schema: Option<String> = client
+        .query_one(
+            "SELECT n.nspname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             RIGHT JOIN (SELECT to_regclass('_wm_migrations')::oid AS oid) t ON c.oid = t.oid",
+            &[],
+        )
+        .await
+        .map_err(read_err)?
+        .get(0);
+    let mut applied =
+        AppliedMigrations { schema, datatables: vec![], versions: vec![], installed_at: vec![] };
+    let Some(schema) = applied.schema.as_deref() else {
+        return Ok(applied);
+    };
+    let rows = client
+        .query(
+            &format!(
+                // ISO 8601 in UTC: `::text` follows the session's `DateStyle`, which the copy's
+                // session need not parse the same way.
+                "SELECT datatable, version, \
+                 to_char(installed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') \
+                 FROM {}._wm_migrations",
+                render_db_quoted_identifier(schema, DbType::Postgresql)
+            ),
+            &[],
+        )
+        .await
+        .map_err(read_err)?;
+    for row in rows {
+        applied.datatables.push(row.get(0));
+        applied.versions.push(row.get(1));
+        applied.installed_at.push(row.get(2));
+    }
+    Ok(applied)
+}
+
+/// Write the rows [`read_applied_migrations`] read into a copy restored from a schema-only dump,
+/// which brings `_wm_migrations` over empty: without them the copy reports every migration its
+/// schema already holds as pending, and running them fails on objects that exist.
+pub(crate) async fn write_applied_migrations(
+    db: &DB,
+    target: &PgDatabase,
+    applied: &AppliedMigrations,
+) -> Result<()> {
+    let Some(schema) = applied.schema.as_deref() else {
+        return Ok(());
+    };
+    if applied.versions.is_empty() {
+        return Ok(());
+    }
+    let (client, connection) = target.connect(Some(db)).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::error!("Datatable connection error: {}", e);
+        }
+    });
     client
-        .batch_execute("SELECT pg_advisory_lock(hashtext('windmill_datatable_migrations')::int8)")
+        .execute(
+            &format!(
+                "INSERT INTO {}._wm_migrations (datatable, version, installed_at) \
+                 SELECT d, v, i::timestamp AT TIME ZONE 'UTC' \
+                 FROM unnest($1::text[], $2::bigint[], $3::text[]) AS t(d, v, i) \
+                 ON CONFLICT DO NOTHING",
+                render_db_quoted_identifier(schema, DbType::Postgresql)
+            ),
+            &[
+                &applied.datatables,
+                &applied.versions,
+                &applied.installed_at,
+            ],
+        )
         .await
         .map_err(|e| {
             Error::internal_err(format!(
-                "Failed to acquire migration lock: {}",
+                "Failed to copy _wm_migrations into '{}': {}",
+                target.dbname,
                 pg_error_message(&e)
             ))
         })?;
-    Ok(client)
+    Ok(())
+}
+
+/// Whether `e` is the lock wait running out, as opposed to the database being unreachable.
+fn is_migration_lock_busy(e: &Error) -> bool {
+    matches!(e, Error::Generic(StatusCode::CONFLICT, _))
 }
 
 /// Read the versions recorded as applied in a data table's `_wm_migrations`,
@@ -804,7 +1001,11 @@ struct DatatableMigrationsStatusResult {
 /// Whether the SQL-migrations feature is enabled for a data table. Honors the
 /// explicit `migrations_enabled` flag; when unset (data tables predating the
 /// feature) it is considered enabled only if migrations already exist.
-async fn datatable_migrations_enabled(db: &DB, w_id: &str, datatable_name: &str) -> Result<bool> {
+pub(crate) async fn datatable_migrations_enabled(
+    db: &DB,
+    w_id: &str,
+    datatable_name: &str,
+) -> Result<bool> {
     let flag: Option<bool> = sqlx::query_scalar!(
         "SELECT (ws.datatable->'datatables'->$2->>'migrations_enabled')::boolean \
          FROM workspace_settings ws WHERE ws.workspace_id = $1",
@@ -1358,7 +1559,13 @@ async fn delete_datatable_migration(
     };
     let lock_client = lock_datatable_migration_runs(&db, &w_id, &datatable_name)
         .await
-        .map_err(unreachable)?;
+        .map_err(|e| {
+            if is_migration_lock_busy(&e) {
+                e
+            } else {
+                unreachable(e)
+            }
+        })?;
     let applied = read_applied_versions_on_client(&lock_client, &datatable_name)
         .await
         .map_err(unreachable)?;
@@ -1533,7 +1740,13 @@ async fn upsert_datatable_migration(
             };
             let client = lock_datatable_migration_runs(&db, &w_id, &datatable_name)
                 .await
-                .map_err(unreachable)?;
+                .map_err(|e| {
+                    if is_migration_lock_busy(&e) {
+                        e
+                    } else {
+                        unreachable(e)
+                    }
+                })?;
             let applied = read_applied_versions_on_client(&client, &datatable_name)
                 .await
                 .map_err(unreachable)?;
@@ -2040,6 +2253,32 @@ pub(crate) async fn clone_datatable_migrations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The holder is found by reassembling the key from the two halves `pg_locks` shows.
+    #[sqlx::test(migrations = false)]
+    async fn a_held_migration_lock_is_reported_with_its_holder(pool: DB) {
+        let mut config: tokio_postgres::Config =
+            std::env::var("DATABASE_URL").unwrap().parse().unwrap();
+        config.dbname(pool.connect_options().get_database().unwrap());
+        let (holder, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(connection);
+        let (waiter, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(connection);
+        hold_migration_lock(&holder, "main", 1).await.unwrap();
+        let holder_pid = holder
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0);
+
+        let busy = hold_migration_lock(&waiter, "main", 1).await.unwrap_err();
+
+        assert!(is_migration_lock_busy(&busy), "{busy:?}");
+        assert!(
+            busy.to_string().contains(&format!("pid {holder_pid}:")),
+            "{busy}"
+        );
+    }
 
     #[test]
     fn validate_migration_name_accepts_safe_names() {

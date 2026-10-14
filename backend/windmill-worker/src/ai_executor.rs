@@ -28,6 +28,7 @@ use windmill_mcp::McpClient;
 use crate::ai::tools::McpClientStub as McpClient;
 use windmill_ai::{
     ai_providers::AIProvider,
+    decision::{decision_inputs, run_decision, AIDecisionArgs},
     image_handler::upload_image_to_s3,
     model_context::model_context_window,
     providers::{
@@ -42,6 +43,7 @@ use windmill_ai::{
         common_outbound_headers, needs_unavailable_oauth_exchange, retain_effective_credentials,
     },
     query_builder::{BuildRequestArgs, ParsedResponse},
+    retry::{as_transient, into_final_error, response_error, send_error, Backoff, MAX_RETRIES},
     types::*,
     utils::{pinned_ai_client_for, should_use_structured_output_tool},
 };
@@ -64,9 +66,13 @@ use windmill_queue::{append_logs, cancel_single_job, CanceledBy, MiniPulledJob};
 use crate::{
     ai::stream_event_processor::StreamEventProcessor,
     common::{
-        build_args_map, resolve_job_timeout, transform_json_value, OccupancyMetrics, StreamNotifier,
+        build_args_map, get_root_job_id, resolve_job_timeout, transform_json_value,
+        OccupancyMetrics, StreamNotifier,
     },
-    handle_child::{run_future_with_polling_update_job_poller_graceful, GracefulPollOutcome},
+    handle_child::{
+        run_future_with_polling_update_job_poller,
+        run_future_with_polling_update_job_poller_graceful, GracefulPollOutcome,
+    },
 };
 
 lazy_static::lazy_static! {
@@ -78,6 +84,20 @@ lazy_static::lazy_static! {
             "user_message": { "type": "string" },
         },
         "required": ["user_message"],
+        "additionalProperties": false,
+    }));
+
+    // Text only: the model writes the state as it reads the conversation, and a schema offering a
+    // union of types is refused by some providers' strict tool schemas.
+    static ref AI_DECISION_TOOL_SCHEMA: Box<RawValue> = to_raw_value(&serde_json::json!({
+        "type": "object",
+        "properties": {
+            "state": {
+                "type": "string",
+                "description": "What the questions are asked about, with only what they need.",
+            },
+        },
+        "required": ["state"],
         "additionalProperties": false,
     }));
 }
@@ -237,6 +257,49 @@ fn keep_authored_memory_id(
         Some(InputTransform::Javascript { .. }) => {}
         Some(InputTransform::Static { .. }) if args.memory_id.as_deref() != Some("") => {}
         _ => args.memory_id = None,
+    }
+}
+
+/// A step's own `model` and `reasoning_effort` inputs replace the provider's, which is how a step
+/// linked to a saved agent picks them per run. An empty model keeps the provider's, since a run
+/// needs one; an empty effort is no effort, which is how a model that reasons only on request is
+/// turned off. A reasoning token is per model, so a different model without an effort of its own
+/// runs at its default.
+/// Only an input the step authored counts: the arguments of an agent run as a tool also carry
+/// whatever the calling model sent, which must not choose the model it runs on.
+fn override_provider_model(
+    provider: &mut ProviderWithResource,
+    local_args: &HashMap<String, Box<RawValue>>,
+    step_input_transforms: &HashMap<String, InputTransform>,
+) {
+    let authored = |key: &str| {
+        step_input_transforms
+            .get(key)
+            .filter(|t| {
+                matches!(
+                    t,
+                    InputTransform::Javascript { .. } | InputTransform::Static { .. }
+                )
+            })
+            .map(|t| match t {
+                // A static null is not evaluated for a tool, which leaves the caller's argument
+                // in its place.
+                InputTransform::Static { value } if value.get() == "null" => String::new(),
+                _ => local_args
+                    .get(key)
+                    .and_then(|v| serde_json::from_str::<String>(v.get()).ok())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default(),
+            })
+    };
+    if let Some(model) = authored("model").filter(|m| !m.is_empty()) {
+        if model != provider.model {
+            provider.model = model;
+            provider.reasoning_effort = None;
+        }
+    }
+    if let Some(effort) = authored("reasoning_effort") {
+        provider.reasoning_effort = Some(effort).filter(|e| !e.is_empty());
     }
 }
 
@@ -497,7 +560,8 @@ fn overlay_tool_inputs(
             FlowModuleValue::Script { input_transforms, .. }
             | FlowModuleValue::RawScript { input_transforms, .. }
             | FlowModuleValue::FlowScript { input_transforms, .. }
-            | FlowModuleValue::AIAgent { input_transforms, .. } => input_transforms,
+            | FlowModuleValue::AIAgent { input_transforms, .. }
+            | FlowModuleValue::AIDecision { input_transforms, .. } => input_transforms,
             _ => continue,
         };
         for (key, transform) in overrides {
@@ -712,6 +776,22 @@ pub async fn handle_ai_agent_job(
 
     let summary = module.summary.clone();
 
+    let module_value = module.get_value()?;
+    if let FlowModuleValue::AIDecision { .. } = module_value {
+        return handle_ai_decision(
+            conn,
+            db,
+            job,
+            &local_args,
+            direct_parent_job_kind == JobKind::AIAgent,
+            canceled_by,
+            mem_peak,
+            occupancy_metrics,
+            worker_name,
+        )
+        .await;
+    }
+
     let FlowModuleValue::AIAgent {
         tools: module_tools,
         omit_output_from_conversation,
@@ -719,7 +799,7 @@ pub async fn handle_ai_agent_job(
         tool_inputs,
         input_transforms: step_input_transforms,
         ..
-    } = module.get_value()?
+    } = module_value
     else {
         return Err(Error::internal_err(
             "AI agent module is not an AI agent".to_string(),
@@ -817,18 +897,21 @@ pub async fn handle_ai_agent_job(
     };
 
     keep_authored_memory_id(&mut args, &step_input_transforms);
+    override_provider_model(&mut args.provider, &local_args, &step_input_transforms);
 
     // Nesting is capped at flow → agent → nested agent. When this job is itself a nested tool,
-    // a linked resource's tool set may still contain AIAgent tools (the editor can't constrain a
-    // shared resource); don't advertise them — invoking one would only fail the depth check as a
-    // third-level agent.
+    // a linked resource's tool set may still contain AIAgent or AIDecision tools (the editor can't
+    // constrain a shared resource); don't advertise them — invoking one would only fail the depth
+    // check as a third level.
     let tools = if direct_parent_job_kind == JobKind::AIAgent {
         tools
             .into_iter()
             .filter(|t| {
                 !matches!(
                     &t.value,
-                    ToolValue::FlowModule(FlowModuleValue::AIAgent { .. })
+                    ToolValue::FlowModule(
+                        FlowModuleValue::AIAgent { .. } | FlowModuleValue::AIDecision { .. }
+                    )
                 )
             })
             .collect()
@@ -1001,6 +1084,18 @@ pub async fn handle_ai_agent_job(
                         ),
                         input_transforms,
                         None,
+                    )
+                }
+                FlowModuleValue::AIDecision { input_transforms, .. } => {
+                    // The calling model supplies only the state: the questions are the tool.
+                    let description = decision_tool_description(&input_transforms);
+                    (
+                        Some(
+                            RawValue::from_string(AI_DECISION_TOOL_SCHEMA.get().to_string())
+                                .expect("AI_DECISION_TOOL_SCHEMA should always be valid JSON"),
+                        ),
+                        input_transforms,
+                        description,
                     )
                 }
                 _ => {
@@ -1241,6 +1336,12 @@ pub async fn run_agent(
     job_completed_tx: crate::JobCompletedSender,
 ) -> error::Result<Box<RawValue>> {
     let output_type = args.output_type.as_ref().unwrap_or(&OutputType::Text);
+    if args.provider.kind.is_decision_provider() {
+        return Err(Error::BadRequest(format!(
+            "{:?} serves decision models, which answer typed questions rather than messages: use an AI decision step",
+            args.provider.kind
+        )));
+    }
     let credentials = args.provider.to_provider_credentials(db).await?;
     let base_url = &credentials.base_url;
     let api_key = credentials.api_key.as_deref().unwrap_or("");
@@ -1603,10 +1704,17 @@ pub async fn run_agent(
         .await;
 
         let mut retried_context = false;
+        let mut backoff = Backoff::default();
+        let streamed_events = || {
+            stream_event_processor
+                .as_ref()
+                .map_or(0, |processor| processor.streamed_events())
+        };
         let (parsed, request_message_count) = loop {
             // How many messages this request carries, so the provider's prompt count can
             // later be told apart from what the response and its tool results add.
             let request_message_count = messages.context().len();
+            let streamed_before = streamed_events();
 
             // Handle AWS Bedrock provider specially using the official SDK
             let attempt: error::Result<_> = async {
@@ -1762,7 +1870,7 @@ pub async fn run_agent(
                         let resp = build_http_request(&endpoint, &auth_headers, request_body)
                             .send()
                             .await
-                            .map_err(|e| Error::internal_err(format!("Failed to call API: {}", e)))?;
+                            .map_err(|e| send_error(e, "Failed to call API"))?;
 
                         match resp.error_for_status_ref() {
                             Ok(_) => {
@@ -1773,6 +1881,7 @@ pub async fn run_agent(
                             }
                             Err(e) => {
                                 let status = resp.status();
+                                let headers = resp.headers().clone();
                                 let text = resp
                                     .text()
                                     .await
@@ -1842,10 +1951,9 @@ pub async fn run_agent(
                                     query_builder = create_chat_completions_query_builder(&credentials);
                                     include_usage = true;
                                 } else {
-                                    return Err(Error::internal_err(format!(
-                                        "API error calling {}: {} - {}",
-                                        endpoint, e, text
-                                    )));
+                                    let message =
+                                        format!("API error calling {}: {} - {}", endpoint, e, text);
+                                    return Err(response_error(status, &headers, &text, message));
                                 }
                             }
                         }
@@ -1859,7 +1967,7 @@ pub async fn run_agent(
                         query_builder.parse_image_response(resp).await?
                     }
                 };
-                Ok(parsed)
+                Ok(parsed.without_nul())
             }.await;
 
             match attempt {
@@ -1905,7 +2013,45 @@ pub async fn run_agent(
                         return Err(error);
                     }
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let Some(transient) = as_transient(&error) else {
+                        return Err(error);
+                    };
+                    // Readers have no way to take back what they were shown, so a call
+                    // that already streamed part of its answer fails as it is.
+                    if streamed_events() != streamed_before {
+                        append_logs(
+                            &job.id,
+                            &job.workspace_id,
+                            "AI provider call failed after part of its answer had streamed; not retried.\n".to_string(),
+                            conn,
+                        )
+                        .await;
+                        return Err(into_final_error(error));
+                    }
+                    let Some(delay) = backoff.next_delay(transient) else {
+                        return Err(into_final_error(error));
+                    };
+                    append_logs(
+                        &job.id,
+                        &job.workspace_id,
+                        format!(
+                            "AI provider call failed: {}. Retrying in {:.1}s (retry {}/{MAX_RETRIES}).\n",
+                            transient.message,
+                            delay.as_secs_f64(),
+                            backoff.retries()
+                        ),
+                        conn,
+                    )
+                    .await;
+                    let mut cancelled = cancel_rx.clone();
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        Ok(_) = cancelled.wait_for(|cancelled| *cancelled) => {
+                            return Err(Error::ExecutionErr("Job cancelled".to_string()));
+                        }
+                    }
+                }
             }
         };
 
@@ -1968,6 +2114,7 @@ pub async fn run_agent(
                                 db,
                                 &conversation_id,
                                 Some(job.id),
+                                get_root_job_id(job),
                                 "Used websearch tool",
                                 MessageType::Tool,
                                 &step_name,
@@ -2020,6 +2167,7 @@ pub async fn run_agent(
                                 db,
                                 &conversation_id,
                                 Some(job.id),
+                                get_root_job_id(job),
                                 response_content,
                                 MessageType::Assistant,
                                 &step_name,
@@ -2150,6 +2298,7 @@ pub async fn run_agent(
                             db,
                             &conversation_id,
                             Some(job.id),
+                            get_root_job_id(job),
                             answer,
                             MessageType::Assistant,
                             &step_name,
@@ -2201,6 +2350,7 @@ pub async fn run_agent(
                             db,
                             &conversation_id,
                             Some(job.id),
+                            get_root_job_id(job),
                             &message_content,
                             MessageType::Assistant,
                             &step_name,
@@ -2372,6 +2522,104 @@ pub async fn run_agent(
             final_usage
         },
     }))
+}
+
+/// An AI decision, run as a flow step or as a tool of an agent: its questions answered about its
+/// state in one call, with no loop, tools, memory or stream. It writes no conversation row: it is
+/// not an agent step, so a chat flow posts its result like any other step's.
+async fn handle_ai_decision(
+    conn: &Connection,
+    db: &DB,
+    job: &MiniPulledJob,
+    local_args: &HashMap<String, Box<RawValue>>,
+    as_tool: bool,
+    canceled_by: &mut Option<CanceledBy>,
+    mem_peak: &mut i32,
+    occupancy_metrics: &mut OccupancyMetrics,
+    worker_name: &str,
+) -> error::Result<Box<RawValue>> {
+    let args = serde_json::from_str::<AIDecisionArgs>(&serde_json::to_string(local_args)?)?;
+    if !args.provider.kind.runs_decisions() {
+        return Err(Error::BadRequest(format!(
+            "An AI decision runs on a TypeSafe, Cloudflare or OpenAI resource, not {:?}",
+            args.provider.kind
+        )));
+    }
+    let (state, questions) = decision_inputs(args.state.as_ref(), args.questions.as_ref())?;
+    let credentials = args.provider.to_provider_credentials(db).await?;
+    let timeout = resolve_job_timeout(conn, &job.workspace_id, job.id, job.timeout)
+        .await
+        .0;
+    // Under the job poller, so the job keeps its heartbeat and a cancel drops the request.
+    let result = run_future_with_polling_update_job_poller(
+        job.id,
+        job.timeout,
+        conn,
+        mem_peak,
+        canceled_by,
+        run_decision(
+            &credentials,
+            args.provider.get_model(),
+            state,
+            questions,
+            timeout,
+        ),
+        worker_name,
+        &job.workspace_id,
+        &mut Some(occupancy_metrics),
+        Box::pin(futures::stream::once(async { 0 })),
+    )
+    .await?;
+    windmill_common::feature_usage::log_feature_usage(
+        "ai_decision",
+        "run",
+        if as_tool { "tool" } else { "step" },
+    );
+    Ok(to_raw_value(&result))
+}
+
+/// What a decision tool tells the calling model it answers, read off its static questions. None
+/// when they come from an expression, which only a run evaluates.
+fn decision_tool_description(input_transforms: &HashMap<String, InputTransform>) -> Option<String> {
+    let InputTransform::Static { value } = input_transforms.get("questions")? else {
+        return None;
+    };
+    let questions = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value.get())
+        .ok()
+        .filter(|questions| !questions.is_empty())?;
+    let described = questions
+        .iter()
+        .map(|(name, question)| {
+            let criteria = question.get("criteria");
+            let kind = match question.get("type").and_then(|t| t.as_str()) {
+                Some("choice") => {
+                    let options = criteria
+                        .and_then(|c| c.as_object())
+                        .map(|c| c.keys().cloned().collect::<Vec<_>>().join(", "))
+                        .unwrap_or_default();
+                    format!("one of {options}")
+                }
+                Some("score") => {
+                    let levels = criteria
+                        .and_then(|c| c.as_array())
+                        .map(|c| {
+                            c.iter()
+                                .filter_map(|l| l.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" < ")
+                        })
+                        .unwrap_or_default();
+                    format!("a score over {levels}")
+                }
+                _ => "yes or no".to_string(),
+            };
+            format!("{name} ({kind})")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "Answers these questions about the state it is given, with probabilities: {described}."
+    ))
 }
 
 /// Whether the step asked for its answer as it is generated. Absence means on, matching the
@@ -2737,6 +2985,70 @@ mod tests {
     }
 
     #[test]
+    fn step_model_and_effort_replace_the_providers() {
+        use serde_json::json;
+        let run = |step: serde_json::Value| {
+            let mut provider: ProviderWithResource = serde_json::from_value(json!({
+                "kind": "openai",
+                "resource": {},
+                "model": "saved-model",
+                "reasoning_effort": "high"
+            }))
+            .unwrap();
+            let local_args: HashMap<String, Box<RawValue>> = serde_json::from_value(step).unwrap();
+            let authored = local_args
+                .keys()
+                .map(|key| {
+                    (
+                        key.clone(),
+                        InputTransform::Javascript { expr: String::new() },
+                    )
+                })
+                .collect();
+            override_provider_model(&mut provider, &local_args, &authored);
+            (provider.model, provider.reasoning_effort)
+        };
+        let saved = ("saved-model".to_string(), Some("high".to_string()));
+
+        // An argument the step did not author is the calling model's, on an agent run as a tool.
+        let mut provider: ProviderWithResource = serde_json::from_value(
+            json!({ "kind": "openai", "resource": {}, "model": "saved-model" }),
+        )
+        .unwrap();
+        let sent = serde_json::from_value(json!({ "model": "other" })).unwrap();
+        override_provider_model(&mut provider, &sent, &HashMap::new());
+        assert_eq!(provider.model, "saved-model");
+        let null = HashMap::from([(
+            "model".to_string(),
+            InputTransform::Static { value: to_raw_value(&serde_json::Value::Null) },
+        )]);
+        override_provider_model(&mut provider, &sent, &null);
+        assert_eq!(provider.model, "saved-model");
+
+        assert_eq!(run(json!({})), saved);
+        assert_eq!(run(json!({ "model": "" })), saved);
+        assert_eq!(run(json!({ "model": "saved-model" })), saved);
+        // An effort the step sets to nothing is no effort, not the saved one.
+        assert_eq!(
+            run(json!({ "reasoning_effort": null })),
+            ("saved-model".to_string(), None)
+        );
+        assert_eq!(
+            run(json!({ "reasoning_effort": "low" })),
+            ("saved-model".to_string(), Some("low".to_string()))
+        );
+        // The saved effort names a level of the saved model, so it does not follow to another one.
+        assert_eq!(
+            run(json!({ "model": "other" })),
+            ("other".to_string(), None)
+        );
+        assert_eq!(
+            run(json!({ "model": "other", "reasoning_effort": "low" })),
+            ("other".to_string(), Some("low".to_string()))
+        );
+    }
+
+    #[test]
     fn overlay_tool_inputs_binds_matching_flowmodule_tool_only() {
         fn js(expr: &str) -> InputTransform {
             InputTransform::Javascript { expr: expr.to_string() }
@@ -2745,6 +3057,7 @@ mod tests {
             let mut its = HashMap::new();
             its.insert(key.to_string(), js(expr));
             AgentTool {
+                job_token_scopes: None,
                 id: id.to_string(),
                 summary: None,
                 description: None,
@@ -2772,6 +3085,7 @@ mod tests {
             script_tool("a", "x", "authoring_flow_expr"),
             script_tool("b", "y", "keep_me"),
             AgentTool {
+                job_token_scopes: None,
                 id: "m".to_string(),
                 summary: None,
                 description: None,
@@ -2819,6 +3133,7 @@ mod tests {
     fn narrow_roster_keeps_the_entries_a_run_named() {
         fn named(id: &str, summary: &str) -> AgentTool {
             AgentTool {
+                job_token_scopes: None,
                 id: id.to_string(),
                 summary: Some(summary.to_string()),
                 description: None,
@@ -2834,6 +3149,7 @@ mod tests {
         }
         fn mcp(id: &str, summary: &str, path: &str) -> AgentTool {
             AgentTool {
+                job_token_scopes: None,
                 id: id.to_string(),
                 summary: Some(summary.to_string()),
                 description: None,
@@ -2846,6 +3162,7 @@ mod tests {
         }
         fn websearch(id: &str, summary: Option<&str>) -> AgentTool {
             AgentTool {
+                job_token_scopes: None,
                 id: id.to_string(),
                 summary: summary.map(str::to_string),
                 description: None,

@@ -4,7 +4,8 @@
 	const bubble = createBubbler()
 	import type { Schema } from '$lib/common'
 	import { VariableService } from '$lib/gen'
-	import { allTrue, computeShow, type DynamicInput } from '$lib/utils'
+	import { allTrue, type DynamicInput } from '$lib/utils'
+	import { computeShow, quickjsSettled } from '$lib/utils/quickjsEval.svelte'
 	import { Button } from './common'
 	import ItemPicker from './ItemPicker.svelte'
 	import VariableEditor from './VariableEditor.svelte'
@@ -232,7 +233,9 @@
 				continue
 			}
 			if (prop?.showExpr) {
-				if (computeShow(x.value, prop.showExpr, args)) {
+				const show = computeShow(prop.showExpr, args)
+				if (show === undefined) continue
+				if (show) {
 					hidden[x.value] = false
 				} else if (!hidden[x.value]) {
 					hidden[x.value] = true
@@ -277,6 +280,7 @@
 			for (const key in args) {
 				args[key]
 			}
+			quickjsSettled()
 		}
 		untrack(() => handleHiddenFields(schema, args ?? {}))
 	})
@@ -296,7 +300,14 @@
 <!-- {JSON.stringify(schema)} -->
 <div
 	class="w-full {className} {flexWrap ? 'flex flex-row flex-wrap gap-x-6 ' : ''} {nestedClasses}"
-	use:dragHandleZone={dndConfig ?? { items: [], dragDisabled: true }}
+	use:dragHandleZone={dndConfig ?? {
+		items: [],
+		dragDisabled: true,
+		// A drag-disabled zone otherwise sets aria-disabled="true" on itself, which screen readers
+		// and Playwright apply to every field inside it.
+		autoAriaDisabled: true,
+		zoneTabIndex: -1
+	}}
 	onfinalize={bubble('finalize')}
 	onconsider={bubble('consider')}
 >
